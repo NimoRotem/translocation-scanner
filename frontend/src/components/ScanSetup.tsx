@@ -18,6 +18,7 @@ interface Settings {
   bg_pvalue_threshold: number;
   centromere_margin: number;
   skip_clip_realignment: boolean;
+  skip_external_callers: boolean;
   parallel_extraction: boolean;
   num_workers: number;
 }
@@ -33,6 +34,7 @@ const DEFAULTS: Settings = {
   bg_pvalue_threshold: 0.001,
   centromere_margin: 1_000_000,
   skip_clip_realignment: false,
+  skip_external_callers: false,
   parallel_extraction: true,
   num_workers: 0,
 };
@@ -107,6 +109,11 @@ const SETTING_DEFS: SettingDef[] = [
   {
     key: 'skip_clip_realignment', label: 'Skip Clip Realignment', type: 'boolean',
     tooltip: 'Skip the minimap2 clip realignment stage. Disabling saves time but loses the ability to identify partner loci from soft-clipped sequences. Recommended to keep enabled when minimap2 is available.',
+    category: 'clustering',
+  },
+  {
+    key: 'skip_external_callers', label: 'Skip DELLY (Fast Mode)', type: 'boolean',
+    tooltip: 'Skip the external DELLY caller. DELLY on a full 30x WGS BAM takes ~40 min. Skipping gives results in ~7 min using blind discovery only.',
     category: 'clustering',
   },
   {
