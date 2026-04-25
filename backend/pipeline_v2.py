@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -627,15 +628,35 @@ class PipelineV2:
         self._log("Creating primary-only BAM (%d of %d chroms) for DELLY",
                    len(ref_chroms), len(bam_chroms))
 
-        # samtools view -b -o primary.bam input.bam <chroms...>
-        cmd = ["samtools", "view", "-b", "-@", "4",
-               "-o", primary_bam, self.job.file_path] + ref_chroms
-        subprocess.run(cmd, check=True, capture_output=True, timeout=7200)
+        # Pipe through SAM text to filter header AND remap reference IDs.
+        # BAM stores reference IDs as integers tied to the header; when we
+        # strip SQ lines, the IDs must be remapped.  Going through SAM
+        # text (which uses chromosome names, not IDs) handles this correctly.
+        # The awk filter drops @SQ lines for non-reference chromosomes.
+        ref_set = set(ref_chroms)
+        # Build awk filter: keep all non-SQ lines; for SQ lines, only keep
+        # those whose SN field is in the reference set.
+        ref_awk_set = "; ".join(f'r["{c}"]=1' for c in ref_chroms)
+        awk_script = (
+            f'BEGIN{{{ref_awk_set}}} '
+            '/^@SQ/{sn=""; for(i=1;i<=NF;i++){if($i~/^SN:/){sn=substr($i,4)}} '
+            'if(!(sn in r))next} {print}'
+        )
+        pipe_cmd = (
+            f'samtools view -h -@ 2 {shlex.quote(self.job.file_path)}'
+            f' {" ".join(shlex.quote(c) for c in ref_chroms)}'
+            f' | awk \'{awk_script}\''
+            f' | samtools view -bS -@ 2 -o {shlex.quote(primary_bam)} -'
+        )
+        subprocess.run(
+            pipe_cmd, shell=True, check=True,
+            capture_output=True, timeout=7200,
+        )
 
-        # Index the new BAM
+        # Index
         subprocess.run(
             ["samtools", "index", "-@", "4", primary_bam],
-            check=True, capture_output=True, timeout=600,
+            check=True, capture_output=True, timeout=1200,
         )
 
         self._log("Primary-only BAM ready: %s", primary_bam)
