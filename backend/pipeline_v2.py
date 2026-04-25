@@ -168,7 +168,11 @@ class PipelineV2:
             external_bnds = self._stage_external_callers()
             dt = time.time() - t0
             self._report_data["timings"]["external_callers"] = round(dt, 1)
-            self._check_time_budget("external_callers", dt)
+            # No time budget check here — DELLY has its own subprocess timeout
+            # and returns empty results on timeout (non-fatal)
+            if dt > self._DELLY_TIMEOUT:
+                self._log("external_callers took %.0fs (DELLY timed out, continuing without)", dt,
+                          level=logging.WARNING)
             self._match_external_calls(clusters, external_bnds)
             self._check_cancel()
 

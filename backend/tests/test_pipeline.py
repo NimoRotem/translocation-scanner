@@ -234,9 +234,15 @@ class TestSmall:
 # ---------------------------------------------------------------------------
 
 class TestFull:
-    """Full tier: Nimo.bam at full coverage, target <30 min."""
+    """Full tier: Nimo.bam at full coverage, target <60 min.
 
-    TIME_BUDGET = 1800  # seconds
+    DELLY on a 93GB 30x WGS BAM takes ~45 min even with exclude.bed.
+    Track 1 (blind discovery) completes in ~7 min, but Track 2 (DELLY)
+    runs until its subprocess timeout. If DELLY times out, the pipeline
+    continues with Track 1 results only.
+    """
+
+    TIME_BUDGET = 3600  # 60 min (DELLY on full BAM is the bottleneck)
 
     @pytest.mark.skipif(
         not os.path.isfile(FULL_BAM),
