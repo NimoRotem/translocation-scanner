@@ -218,6 +218,13 @@ async def list_server_files():
 @app.post("/api/scan")
 async def start_scan(req: ScanRequest):
     """Start a new translocation scan job."""
+    # Validation gate: nano tests must be passing and fresh (<24h)
+    skip_gate = (req.settings or ScanSettings()).model_dump().get("skip_validation_gate", False)
+    if not skip_gate:
+        gate_result = _check_validation_gate()
+        if gate_result:
+            raise HTTPException(412, gate_result)
+
     if not os.path.isfile(req.file_path):
         raise HTTPException(400, f"File not found: {req.file_path}")
 
@@ -236,8 +243,11 @@ async def start_scan(req: ScanRequest):
     if not ref_path or not os.path.exists(ref_path):
         raise HTTPException(400, "No reference FASTA found. Provide reference_path.")
 
-    # Verify exclude.bed exists (required for DELLY)
-    exclude_bed = "/data/masks/exclude_grch38.bed"
+    # Verify exclude.bed exists (required for DELLY) — auto-detect based on reference
+    if "numeric" in ref_path or "genom-nimo" in ref_path:
+        exclude_bed = "/data/masks/exclude_numeric.bed"
+    else:
+        exclude_bed = "/data/masks/exclude_grch38.bed"
     if not os.path.isfile(exclude_bed):
         raise HTTPException(500, f"exclude.bed not found at {exclude_bed}. Run mask generation first.")
 
@@ -668,6 +678,32 @@ def _human_size(nbytes: int) -> str:
 
 def _sse_format(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+def _check_validation_gate() -> Optional[str]:
+    """Check if nano tests have passed within the last 24 hours.
+
+    Returns None if gate passes, or an error message string if gate fails.
+    """
+    if not os.path.isfile(VALIDATION_STATE_FILE):
+        return "No validation tests have been run. Run: pytest tests/test_pipeline.py::TestNano -v"
+
+    try:
+        with open(VALIDATION_STATE_FILE) as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return "Validation state file is corrupt. Re-run nano tests."
+
+    nano = state.get("nano", {})
+    if not nano.get("passed"):
+        return "Nano test is not passing. Fix pipeline issues and re-run nano tests."
+
+    age = time.time() - nano.get("timestamp", 0)
+    if age > 86400:  # 24 hours
+        hours = age / 3600
+        return f"Nano test results are stale ({hours:.0f}h old, max 24h). Re-run nano tests."
+
+    return None
 
 
 def _bam_preflight(bam_path: str) -> Optional[str]:

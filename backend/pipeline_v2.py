@@ -51,12 +51,12 @@ class PipelineV2:
         "clustering": 120,        # 2 min
         "clip_realignment": 120,  # 2 min
         "annotation": 60,         # 1 min
-        "external_callers": 1200, # 20 min (DELLY only, with exclude.bed + OMP)
+        "external_callers": 2400, # 40 min (DELLY on full WGS BAM is slow)
         "background_model": 60,   # 1 min
         "filtering": 30,          # 30s
         "output": 30,             # 30s
     }
-    _DELLY_TIMEOUT: int = 1200    # 20 min cap on DELLY (with exclude.bed should be ~5-10 min)
+    _DELLY_TIMEOUT: int = 2400    # 40 min cap for DELLY on 30x WGS BAM
     _DELLY_OMP_THREADS: int = 14  # Half of 32 cores for DELLY's OpenMP
     _EXCLUDE_BED_CHR: str = "/data/masks/exclude_grch38.bed"
     _EXCLUDE_BED_NUMERIC: str = "/data/masks/exclude_numeric.bed"
@@ -669,13 +669,14 @@ class PipelineV2:
             return bnds
 
         except subprocess.TimeoutExpired:
-            self._log("DELLY TIMEOUT after %ds — aborting", self._DELLY_TIMEOUT, level=logging.ERROR)
-            # Clean up
+            self._log("DELLY TIMEOUT after %ds — continuing without DELLY corroboration",
+                       self._DELLY_TIMEOUT, level=logging.WARNING)
             try:
                 os.unlink(out_path)
             except OSError:
                 pass
-            raise RuntimeError(f"DELLY timed out after {self._DELLY_TIMEOUT}s")
+            # Non-fatal: Track 1 results are still valid without DELLY
+            return []
 
         except subprocess.CalledProcessError as e:
             stderr = e.stderr.decode("utf-8", errors="replace")[:1000] if e.stderr else ""
