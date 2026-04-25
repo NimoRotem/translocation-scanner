@@ -490,6 +490,7 @@ async def get_report(job_id: str):
             "summary": interp_summary,
             "detail": interp_detail,
         },
+        "mask_manifest_version": report_data.get("mask_manifest_version", ""),
         "warnings": warnings,
     }
 
