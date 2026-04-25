@@ -47,17 +47,19 @@ class PipelineV2:
     # its budget, the pipeline logs a warning and continues — hard kills
     # happen only at the subprocess level (the timeouts on subprocess.run).
     _STAGE_TIME_BUDGETS: dict[str, int] = {
-        "extraction": 600,        # 10 min
+        "extraction": 300,        # 5 min (parallel, 24 workers)
         "clustering": 120,        # 2 min
-        "clip_realignment": 300,  # 5 min
-        "annotation": 120,        # 2 min
-        "external_callers": 3660, # ~1 hr (delly_call 3600s + manta_call 60s overhead)
-        "background_model": 300,  # 5 min
-        "filtering": 60,          # 1 min
-        "output": 60,             # 1 min
+        "clip_realignment": 120,  # 2 min
+        "annotation": 60,         # 1 min
+        "external_callers": 1200, # 20 min (DELLY only, with exclude.bed + OMP)
+        "background_model": 60,   # 1 min
+        "filtering": 30,          # 30s
+        "output": 30,             # 30s
     }
-    _DELLY_TIMEOUT: int = 3600    # 1 hr cap on DELLY
-    _MANTA_TIMEOUT: int = 3600    # 1 hr cap on Manta
+    _DELLY_TIMEOUT: int = 1200    # 20 min cap on DELLY (with exclude.bed should be ~5-10 min)
+    _DELLY_OMP_THREADS: int = 14  # Half of 32 cores for DELLY's OpenMP
+    _EXCLUDE_BED_CHR: str = "/data/masks/exclude_grch38.bed"
+    _EXCLUDE_BED_NUMERIC: str = "/data/masks/exclude_numeric.bed"
 
     def __init__(self, job: ScanJob, event_callback=None, cancel_event=None):
         self.job = job
@@ -559,11 +561,14 @@ class PipelineV2:
     # ------------------------------------------------------------------
 
     def _stage_external_callers(self) -> list[dict]:
-        """Run Manta/DELLY and collect interchromosomal BNDs.
+        """Run DELLY and collect interchromosomal BNDs.
 
-        The reference FASTA must contain every contig present in the BAM
-        header (use N-filled sequences for alt/decoy contigs).  This
-        eliminates the need for slow primary-BAM subsetting.
+        DELLY runs with:
+          - exclude.bed to skip 3342 alt/decoy/HLA contigs
+          - OMP_NUM_THREADS for multi-core parallelism
+          - Strict time budget (20 min)
+
+        Manta is REMOVED — requires Python 2 which is not installed.
         """
         self.job.stage = ScanStage.EXTERNAL_CALLERS
         self.emit({"type": "scan.stage_changed", "stage": "external_callers"})
@@ -572,92 +577,78 @@ class PipelineV2:
             self._log("External callers skipped by settings")
             return []
 
-        bnds = []
-
-        # Try Manta
-        self.emit({"type": "scan.substage", "stage": "external_callers",
-                    "substage": "manta"})
-        t0 = time.time()
-        manta_bnds = self._run_manta()
-        bnds.extend(manta_bnds)
-        if manta_bnds or time.time() - t0 > 1:
-            self._log("Manta: %.1fs, %d BNDs", time.time() - t0, len(manta_bnds))
-
-        # Try DELLY (runs directly on original BAM — no header surgery needed)
         self.emit({"type": "scan.substage", "stage": "external_callers",
                     "substage": "delly"})
         t0 = time.time()
         delly_bnds = self._run_delly()
-        bnds.extend(delly_bnds)
-        self._log("DELLY: %.1fs, %d BNDs", time.time() - t0, len(delly_bnds))
+        dt = time.time() - t0
+        self._log("DELLY: %.1fs, %d interchromosomal BNDs", dt, len(delly_bnds))
 
-        self._log("External callers: %d total BNDs (%d Manta, %d DELLY)",
-                   len(bnds), len(manta_bnds), len(delly_bnds))
-        return bnds
-
-    def _run_manta(self) -> list[dict]:
-        """Run Manta and parse interchromosomal BNDs."""
-        if not shutil.which("configManta.py"):
-            self._log("Manta not installed, skipping", level=logging.WARNING)
-            return []
-
-        try:
-            workdir = tempfile.mkdtemp(prefix="manta_")
-            cmd_config = [
-                "configManta.py",
-                "--bam", self.job.file_path,
-                "--referenceFasta", self.job.reference_path,
-                "--runDir", workdir,
-            ]
-            subprocess.run(cmd_config, check=True, capture_output=True, timeout=120)
-
-            cmd_run = [os.path.join(workdir, "runWorkflow.py"), "-j", "4"]
-            subprocess.run(cmd_run, check=True, capture_output=True, timeout=self._MANTA_TIMEOUT)
-
-            # Parse diploidSV VCF
-            vcf_path = os.path.join(workdir, "results", "variants", "diploidSV.vcf.gz")
-            if not os.path.exists(vcf_path):
-                vcf_path = os.path.join(workdir, "results", "variants", "diploidSV.vcf")
-
-            bnds = self._parse_bnd_vcf(vcf_path, "manta")
-            shutil.rmtree(workdir, ignore_errors=True)
-            self._log("Manta: %d interchromosomal BNDs", len(bnds))
-            return bnds
-
-        except FileNotFoundError:
-            return []
-        except subprocess.TimeoutExpired:
-            self._log("Manta timed out", level=logging.WARNING)
-            return []
-        except Exception as e:
-            self._log("Manta failed: %s", e, level=logging.WARNING)
-            return []
+        return delly_bnds
 
     def _run_delly(self) -> list[dict]:
-        """Run DELLY and parse interchromosomal BNDs.
+        """Run DELLY with exclude.bed and OMP threading.
 
-        Requires that the reference FASTA contains every contig listed
-        in the BAM header.  Missing contigs should be added as N-filled
-        sequences (see tools/extend_reference.py).
+        Critical requirements:
+          - exclude.bed MUST be passed via -x to skip alt/decoy contigs
+          - OMP_NUM_THREADS set to use multiple cores
+          - Full command line logged at INFO level
+          - Strict timeout enforcement
         """
         if not shutil.which("delly"):
-            self._log("DELLY not installed, skipping", level=logging.WARNING)
-            return []
+            raise RuntimeError(
+                "DELLY not found on PATH. Install DELLY or add to PATH. "
+                "External caller validation requires DELLY."
+            )
 
         input_bam = self.job.file_path
+        # Auto-detect exclude.bed based on reference chromosome naming
+        if self.settings.get("exclude_bed"):
+            exclude_bed = self.settings["exclude_bed"]
+        elif "numeric" in self.job.reference_path or "genom-nimo" in self.job.reference_path:
+            exclude_bed = self._EXCLUDE_BED_NUMERIC
+        else:
+            exclude_bed = self._EXCLUDE_BED_CHR
+
+        # Verify exclude.bed exists
+        if not os.path.isfile(exclude_bed):
+            raise RuntimeError(
+                f"exclude.bed not found at {exclude_bed}. "
+                f"Generate it from the reference .fai: all non-primary contigs. "
+                f"DELLY cannot run without it (3342 alt contigs would take hours)."
+            )
+
+        with tempfile.NamedTemporaryFile(suffix=".bcf", delete=False) as tmp:
+            out_path = tmp.name
+
+        cmd = [
+            "delly", "call",
+            "-g", self.job.reference_path,
+            "-x", exclude_bed,
+            "-o", out_path,
+            input_bam,
+        ]
+
+        # Log the FULL command line at INFO level
+        cmd_str = " ".join(cmd)
+        self._log("DELLY command: %s", cmd_str)
+        self._log("DELLY OMP_NUM_THREADS=%d, timeout=%ds", self._DELLY_OMP_THREADS, self._DELLY_TIMEOUT)
+
+        # Set OMP_NUM_THREADS for DELLY's internal parallelism
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(self._DELLY_OMP_THREADS)
 
         try:
-            with tempfile.NamedTemporaryFile(suffix=".bcf", delete=False) as tmp:
-                out_path = tmp.name
-
-            cmd = [
-                "delly", "call",
-                "-g", self.job.reference_path,
-                "-o", out_path,
-                input_bam,
-            ]
-            self._log("Running DELLY: %s", " ".join(cmd[-3:]))
-            subprocess.run(cmd, check=True, capture_output=True, timeout=self._DELLY_TIMEOUT)
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                timeout=self._DELLY_TIMEOUT,
+                env=env,
+            )
+            stderr_str = result.stderr.decode("utf-8", errors="replace")
+            if stderr_str.strip():
+                self._log("DELLY stderr: %s", stderr_str[:500])
 
             # Convert BCF to VCF for parsing
             vcf_path = out_path.replace(".bcf", ".vcf")
@@ -667,27 +658,33 @@ class PipelineV2:
             )
 
             bnds = self._parse_bnd_vcf(vcf_path, "delly")
+
             for p in [out_path, vcf_path]:
                 try:
                     os.unlink(p)
                 except OSError:
                     pass
 
-            self._log("DELLY: %d interchromosomal BNDs", len(bnds))
+            self._log("DELLY: %d interchromosomal BNDs parsed", len(bnds))
             return bnds
 
-        except FileNotFoundError:
-            return []
         except subprocess.TimeoutExpired:
-            self._log("DELLY timed out", level=logging.WARNING)
-            return []
+            self._log("DELLY TIMEOUT after %ds — aborting", self._DELLY_TIMEOUT, level=logging.ERROR)
+            # Clean up
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise RuntimeError(f"DELLY timed out after {self._DELLY_TIMEOUT}s")
+
         except subprocess.CalledProcessError as e:
-            stderr = e.stderr.decode("utf-8", errors="replace")[:500] if e.stderr else ""
-            self._log("DELLY failed (exit %s): %s", e.returncode, stderr, level=logging.WARNING)
-            return []
-        except Exception as e:
-            self._log("DELLY failed: %s", e, level=logging.WARNING)
-            return []
+            stderr = e.stderr.decode("utf-8", errors="replace")[:1000] if e.stderr else ""
+            self._log("DELLY failed (exit %s): %s", e.returncode, stderr, level=logging.ERROR)
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise RuntimeError(f"DELLY failed with exit code {e.returncode}: {stderr[:200]}")
 
     @staticmethod
     def _parse_bnd_vcf(vcf_path: str, caller: str) -> list[dict]:

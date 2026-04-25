@@ -221,16 +221,25 @@ async def start_scan(req: ScanRequest):
     if not os.path.isfile(req.file_path):
         raise HTTPException(400, f"File not found: {req.file_path}")
 
+    # BAM preflight validation
+    preflight_error = _bam_preflight(req.file_path)
+    if preflight_error:
+        raise HTTPException(400, preflight_error)
+
     # Auto-detect reference if not provided
     ref_path = req.reference_path
     if not ref_path:
         ref_path = REFERENCE_PATHS.get(req.reference_build)
         if not ref_path or not os.path.exists(ref_path):
-            # Try to detect from BAM header
             ref_path = _detect_reference(req.file_path)
 
     if not ref_path or not os.path.exists(ref_path):
         raise HTTPException(400, "No reference FASTA found. Provide reference_path.")
+
+    # Verify exclude.bed exists (required for DELLY)
+    exclude_bed = "/data/masks/exclude_grch38.bed"
+    if not os.path.isfile(exclude_bed):
+        raise HTTPException(500, f"exclude.bed not found at {exclude_bed}. Run mask generation first.")
 
     settings = (req.settings or ScanSettings()).model_dump()
     job = ScanJob(
@@ -582,6 +591,45 @@ def _human_size(nbytes: int) -> str:
 
 def _sse_format(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+def _bam_preflight(bam_path: str) -> Optional[str]:
+    """Validate BAM before starting pipeline. Returns error string or None."""
+    try:
+        import pysam
+    except ImportError:
+        return None  # Can't validate without pysam, pipeline will fail later
+
+    try:
+        # Check file exists and is readable
+        if not os.path.isfile(bam_path):
+            return f"BAM file not found: {bam_path}"
+
+        # Check for index
+        bai_paths = [
+            bam_path + ".bai",
+            bam_path.rsplit(".", 1)[0] + ".bai" if "." in bam_path else "",
+            bam_path + ".crai",
+        ]
+        has_index = any(os.path.isfile(p) for p in bai_paths if p)
+        if not has_index:
+            return f"BAM index not found. Expected one of: {', '.join(p for p in bai_paths if p)}"
+
+        # Check it's coordinate-sorted and has SQ entries
+        with pysam.AlignmentFile(bam_path, check_sq=False) as bam:
+            header = bam.header
+            sq = header.get("SQ", [])
+            if not sq:
+                return "BAM header has no @SQ entries"
+
+            hd = header.get("HD", {})
+            so = hd.get("SO", "unknown")
+            if so not in ("coordinate", "unknown"):
+                return f"BAM is not coordinate-sorted (SO={so}). Re-sort with samtools sort."
+
+        return None
+    except Exception as e:
+        return f"BAM preflight failed: {e}"
 
 
 def _detect_reference(bam_path: str) -> Optional[str]:
