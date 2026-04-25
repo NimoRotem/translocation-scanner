@@ -161,7 +161,7 @@ class ClusterEngine:
         split_clusters = self._group_and_merge(
             split_reads,
             EvidenceType.SPLIT,
-            self.refined_distance,
+            self.merge_distance,  # use merge_distance, not refined_distance: SVRead.pos is alignment start, not breakpoint
             cancel_event=cancel_event,
         )
         logger.info(
@@ -628,14 +628,23 @@ class ClusterEngine:
         self,
         raw_clusters: list[_RawCluster],
     ) -> list[_RawCluster]:
-        """Merge raw clusters from different evidence types that overlap spatially."""
+        """Merge raw clusters from different evidence types that overlap spatially.
+
+        Buckets by (chrom_a, chrom_b) only — orientation is intentionally
+        excluded because different evidence types (discordant, split, clip)
+        compute orientation differently for the same breakpoint:
+        - Discordant: read strand + mate strand (from BAM flags 0x10/0x20)
+        - Split: primary strand + SA tag strand
+        These often disagree (e.g. "+-" vs "++"), so requiring exact
+        orientation match would prevent legitimate cross-type merges.
+        """
         if not raw_clusters:
             return []
 
-        # Bucket by (chrom_a, chrom_b, orientation)
-        buckets: dict[tuple[str, str, str], list[_RawCluster]] = defaultdict(list)
+        # Bucket by (chrom_a, chrom_b) — orientation excluded for cross-type merge
+        buckets: dict[tuple[str, str], list[_RawCluster]] = defaultdict(list)
         for rc in raw_clusters:
-            buckets[(rc.chrom_a, rc.chrom_b, rc.orientation)].append(rc)
+            buckets[(rc.chrom_a, rc.chrom_b)].append(rc)
 
         merged_all: list[_RawCluster] = []
 

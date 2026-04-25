@@ -170,13 +170,17 @@ class FilterEngineV2:
         if total_unique < 5:
             return f"low_unique_starts:{total_unique}"
 
-        # local_coverage_ratio > 3 on either side
-        lcr_a = getattr(cluster, 'local_coverage_ratio_a', 0.0)
-        lcr_b = getattr(cluster, 'local_coverage_ratio_b', 0.0)
-        if lcr_a > 3.0:
-            return f"high_local_cov_a:{lcr_a:.1f}"
-        if lcr_b > 3.0:
-            return f"high_local_cov_b:{lcr_b:.1f}"
+        # local_coverage_ratio > 3 on either side (only when SR=0)
+        # When split reads are present, the cluster has base-pair evidence
+        # that is much harder to produce artifactually; the tier-assignment
+        # NB p-value gates handle quality assessment for these clusters.
+        if sr == 0:
+            lcr_a = getattr(cluster, 'local_coverage_ratio_a', 0.0)
+            lcr_b = getattr(cluster, 'local_coverage_ratio_b', 0.0)
+            if lcr_a > 3.0:
+                return f"high_local_cov_a:{lcr_a:.1f}"
+            if lcr_b > 3.0:
+                return f"high_local_cov_b:{lcr_b:.1f}"
 
         # Promiscuous hotspot without split or external caller
         is_promiscuous = getattr(cluster, 'promiscuous_hotspot', False)

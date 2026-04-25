@@ -535,13 +535,28 @@ class PipelineV2:
 
         bnds = []
 
+        # Create primary-only BAM for DELLY (if BAM has alt/decoy contigs)
+        primary_bam = None
+        try:
+            primary_bam = self._make_primary_bam()
+        except Exception as e:
+            self._log("Failed to create primary BAM: %s", e, level=logging.WARNING)
+
         # Try Manta
         manta_bnds = self._run_manta()
         bnds.extend(manta_bnds)
 
         # Try DELLY
-        delly_bnds = self._run_delly()
+        delly_bnds = self._run_delly(bam_path=primary_bam)
         bnds.extend(delly_bnds)
+
+        # Clean up primary BAM
+        if primary_bam:
+            for p in [primary_bam, primary_bam + ".bai"]:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
         self._log("External callers: %d total BNDs (%d Manta, %d DELLY)",
                    len(bnds), len(manta_bnds), len(delly_bnds))
@@ -585,39 +600,66 @@ class PipelineV2:
             self._log("Manta failed: %s", e, level=logging.WARNING)
             return []
 
-    def _run_delly(self) -> list[dict]:
+    def _make_primary_bam(self) -> str | None:
+        """Create a BAM with only primary-assembly chromosomes.
+
+        DELLY validates ALL BAM header contigs against the reference at
+        startup.  When a BAM contains thousands of alt/decoy contigs not
+        in the reference, DELLY refuses to run.  Extracting only the
+        primary chromosomes that exist in the reference solves this.
+        """
+        ref_chroms = sorted(self._chrom_lengths.keys())
+        if not ref_chroms:
+            return None
+
+        import pysam
+        with pysam.AlignmentFile(self.job.file_path, "rb") as af:
+            bam_chroms = set(af.references)
+
+        extra = bam_chroms - set(ref_chroms)
+        if not extra:
+            return None  # BAM already matches reference
+
+        primary_bam = os.path.join(
+            tempfile.gettempdir(),
+            f"primary_{self.job.job_id}.bam",
+        )
+        self._log("Creating primary-only BAM (%d of %d chroms) for DELLY",
+                   len(ref_chroms), len(bam_chroms))
+
+        # samtools view -b -o primary.bam input.bam <chroms...>
+        cmd = ["samtools", "view", "-b", "-@", "4",
+               "-o", primary_bam, self.job.file_path] + ref_chroms
+        subprocess.run(cmd, check=True, capture_output=True, timeout=7200)
+
+        # Index the new BAM
+        subprocess.run(
+            ["samtools", "index", "-@", "4", primary_bam],
+            check=True, capture_output=True, timeout=600,
+        )
+
+        self._log("Primary-only BAM ready: %s", primary_bam)
+        return primary_bam
+
+    def _run_delly(self, bam_path: str | None = None) -> list[dict]:
         """Run DELLY and parse interchromosomal BNDs."""
         if not shutil.which("delly"):
             self._log("DELLY not installed, skipping", level=logging.WARNING)
             return []
 
+        input_bam = bam_path or self.job.file_path
+
         try:
             with tempfile.NamedTemporaryFile(suffix=".bcf", delete=False) as tmp:
                 out_path = tmp.name
-
-            # Build exclude file for non-reference chromosomes
-            exclude_path = None
-            ref_chroms = set(self._chrom_lengths.keys())
-            if ref_chroms:
-                import pysam
-                with pysam.AlignmentFile(self.job.file_path, "rb") as af:
-                    bam_chroms = set(af.references)
-                non_ref = bam_chroms - ref_chroms
-                if non_ref:
-                    exclude_path = out_path + ".exclude.tsv"
-                    with open(exclude_path, "w") as ef:
-                        for chrom in sorted(non_ref):
-                            ef.write(f"{chrom}\n")
-                    self._log("DELLY exclude: %d non-reference chroms", len(non_ref))
 
             cmd = [
                 "delly", "call",
                 "-g", self.job.reference_path,
                 "-o", out_path,
+                input_bam,
             ]
-            if exclude_path:
-                cmd.extend(["-x", exclude_path])
-            cmd.append(self.job.file_path)
+            self._log("Running DELLY: %s", " ".join(cmd[-3:]))
             subprocess.run(cmd, check=True, capture_output=True, timeout=7200)
 
             # Convert BCF to VCF for parsing
@@ -628,12 +670,11 @@ class PipelineV2:
             )
 
             bnds = self._parse_bnd_vcf(vcf_path, "delly")
-            for p in [out_path, vcf_path, exclude_path]:
-                if p:
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
+            for p in [out_path, vcf_path]:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
             self._log("DELLY: %d interchromosomal BNDs", len(bnds))
             return bnds
