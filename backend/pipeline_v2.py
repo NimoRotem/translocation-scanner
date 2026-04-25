@@ -1,7 +1,7 @@
 """Pipeline v2 orchestrator — dual-track architecture.
 
 Track 1: Blind discovery (custom) — primary
-Track 2: External caller validation (Manta/DELLY/GRIDSS) — corroboration
+Track 2: External caller validation (DELLY) — corroboration
 
 Stages:
   1. SV-read extraction (parallel, single-pass)
@@ -47,7 +47,7 @@ class PipelineV2:
     # its budget, the pipeline logs a warning and continues — hard kills
     # happen only at the subprocess level (the timeouts on subprocess.run).
     _STAGE_TIME_BUDGETS: dict[str, int] = {
-        "extraction": 300,        # 5 min (parallel, 24 workers)
+        "extraction": 600,        # 10 min (parallel, 24 workers on 93GB BAM)
         "clustering": 120,        # 2 min
         "clip_realignment": 120,  # 2 min
         "annotation": 60,         # 1 min

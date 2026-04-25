@@ -6,3 +6,6 @@ __pycache__/
 results/
 *.egg-info/
 .vite/
+logs/
+data/
+.pytest_cache/
