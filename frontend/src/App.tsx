@@ -12,6 +12,7 @@ import CandidateStrip from './components/CandidateStrip';
 import ValidatedCallset from './components/ValidatedCallset';
 import ScanReport from './components/ScanReport';
 import PreviousRuns from './components/PreviousRuns';
+import { SSEDebugPanel } from './components/SSEDebugPanel';
 
 export default function App() {
   const {
@@ -176,6 +177,8 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <SSEDebugPanel />
     </div>
   );
 }

@@ -1,0 +1,4 @@
+{
+  "_comment": "Ground truth events — populate with verified coordinates from external sources only. DO NOT auto-fill from pipeline output.",
+  "events": []
+}

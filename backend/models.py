@@ -166,6 +166,24 @@ class EvidenceCluster:
     def total_support(self) -> int:
         return self.discordant_count + self.split_count + self.clipped_count
 
+    def reads_to_dicts(self) -> list[dict]:
+        """Serialize supporting reads for evidence browser."""
+        result = []
+        for r in self.reads:
+            result.append({
+                "pos_a": r.pos_a,
+                "pos_b": r.pos_b,
+                "mapq": r.mapq,
+                "is_reverse": r.is_reverse,
+                "mate_is_reverse": r.mate_is_reverse,
+                "evidence_type": ["discordant", "split", "clipped"][r.evidence_type]
+                    if isinstance(r.evidence_type, int) and 0 <= r.evidence_type <= 2
+                    else str(r.evidence_type),
+                "is_duplicate": bool(r.flag & 0x400),
+                "read_name_hash": r.read_name_hash,
+            })
+        return result
+
     def to_dict(self) -> dict:
         return {
             "event_id": self.event_id,

@@ -218,42 +218,43 @@ class FilterEngineV2:
     # ------------------------------------------------------------------
 
     def _assign_tier(self, cluster: EvidenceCluster) -> None:
-        """Assign tier using ordered gate evaluation (highest first)."""
+        """Assign tier using ordered gate evaluation (highest first).
+
+        Also assigns progressive evidence_label bottom-up:
+          raw_cluster → enriched_cluster → strong_cluster →
+          candidate_junction → likely_translocation → confirmed
+        """
         sr = cluster.split_count
         pr = cluster.discordant_count
         ext = getattr(cluster, 'external_callers', [])
         n_ext = len(ext)
 
+        # Progressive labeling (bottom-up, independent of tier)
+        cluster.evidence_label = self._progressive_label(cluster, sr, pr, n_ext)
+
         # Try CONFIRMED first
         if self._is_confirmed(cluster, sr, pr, n_ext):
             cluster.tier = Tier.CONFIRMED
-            cluster.evidence_label = self._evidence_label(cluster)
             return
 
         # Try VALIDATED
         if self._is_validated(cluster, sr, pr, n_ext):
             cluster.tier = Tier.VALIDATED
-            cluster.evidence_label = self._evidence_label(cluster)
             return
 
         # Try LIKELY
         if self._is_likely(cluster, sr, pr, n_ext):
             cluster.tier = Tier.LIKELY
-            cluster.evidence_label = self._evidence_label(cluster)
             return
 
         # Try STRONG_CANDIDATE
         if self._is_strong_candidate(cluster, sr, pr):
-            # Use LIKELY tier for strong_candidate since our Tier enum
-            # doesn't have STRONG_CANDIDATE — mark via evidence_label
-            cluster.tier = Tier.CANDIDATE
-            cluster.evidence_label = "strong_candidate:" + self._evidence_label(cluster)
+            cluster.tier = Tier.STRONG_CANDIDATE
             return
 
         # Default: CANDIDATE
         if pr >= 3 or sr >= 1:
             cluster.tier = Tier.CANDIDATE
-            cluster.evidence_label = self._evidence_label(cluster)
         else:
             cluster.tier = Tier.FILTERED
             cluster.reject_reasons.append("below_minimum_support")
@@ -400,8 +401,64 @@ class FilterEngineV2:
         # More than 2 distinct orientations = incoherent
         return len(orientations) > 2
 
+    def _progressive_label(
+        self, c: EvidenceCluster, sr: int, pr: int, n_ext: int,
+    ) -> str:
+        """Compute bottom-up evidence label.
+
+        Labels (in ascending order of confidence):
+          raw_cluster         — survived multi-scale cascade
+          enriched_cluster    — PR>=3 or SR>=1
+          strong_cluster      — enriched + NB pvalue<0.01 both sides + no artifact flags
+          candidate_junction  — strong + unique_starts>=5 both + not dup-dominated + not promiscuous + reasonable MAPQ
+          likely_translocation — candidate_junction + (SR>=2 OR 1 external caller)
+          confirmed           — likely + (split/SA evidence at same junction OR external agrees OR manual)
+        """
+        pval_a = getattr(c, 'local_nb_pvalue_a', 1.0)
+        pval_b = getattr(c, 'local_nb_pvalue_b', 1.0)
+        dup_frac = getattr(c, 'duplicate_fraction', 0.0)
+        is_promiscuous = getattr(c, 'promiscuous_hotspot', False)
+
+        # Level 0: raw_cluster (survived cascade, below min support)
+        if pr < 3 and sr < 1:
+            return "raw_cluster"
+
+        # Level 1: enriched_cluster
+        label = "enriched_cluster"
+
+        # Level 2: strong_cluster
+        if (pval_a < 0.01 and pval_b < 0.01
+                and dup_frac <= 0.7
+                and not self._orientation_incoherent(c)):
+            label = "strong_cluster"
+        else:
+            return label
+
+        # Level 3: candidate_junction
+        if (c.unique_starts_a >= 5 and c.unique_starts_b >= 5
+                and dup_frac <= 0.5
+                and not is_promiscuous
+                and c.median_mapq >= 20):
+            label = "candidate_junction"
+        else:
+            return label
+
+        # Level 4: likely_translocation
+        if sr >= 2 or n_ext >= 1:
+            label = "likely_translocation"
+        else:
+            return label
+
+        # Level 5: confirmed
+        has_assembly = getattr(c, 'assembly_resolved', False)
+        has_igv = getattr(c, 'igv_confirmed', False)
+        if has_assembly or n_ext >= 3 or has_igv or (sr >= 3 and pr >= 6):
+            label = "confirmed"
+
+        return label
+
     @staticmethod
-    def _evidence_label(cluster: EvidenceCluster) -> str:
+    def _evidence_type_label(cluster: EvidenceCluster) -> str:
         has_sr = cluster.split_count >= 1
         has_pr = cluster.discordant_count >= 1
         has_clip = cluster.clipped_count >= 1

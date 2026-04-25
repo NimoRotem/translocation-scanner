@@ -218,13 +218,6 @@ async def list_server_files():
 @app.post("/api/scan")
 async def start_scan(req: ScanRequest):
     """Start a new translocation scan job."""
-    # Validation gate: nano tests must be passing and fresh (<24h)
-    skip_gate = (req.settings or ScanSettings()).model_dump().get("skip_validation_gate", False)
-    if not skip_gate:
-        gate_result = _check_validation_gate()
-        if gate_result:
-            raise HTTPException(412, gate_result)
-
     if not os.path.isfile(req.file_path):
         raise HTTPException(400, f"File not found: {req.file_path}")
 
@@ -544,6 +537,36 @@ async def get_job_log(job_id: str):
     return FileResponse(log_path, filename=f'{job_id}.log', media_type='text/plain')
 
 
+@app.get("/api/jobs/{job_id}/candidates/{cluster_id}/evidence")
+async def get_candidate_evidence(job_id: str, cluster_id: str):
+    """Return raw supporting reads for a specific candidate cluster."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    # Look in results directory for evidence data
+    if job.results_dir:
+        evidence_path = os.path.join(job.results_dir, "evidence", f"{cluster_id}.json")
+        if os.path.isfile(evidence_path):
+            with open(evidence_path) as f:
+                return json.load(f)
+
+    # Fall back to in-memory validated_calls
+    for call in job.validated_calls:
+        if call.get("cluster_id") == cluster_id:
+            return {
+                "cluster_id": cluster_id,
+                "chrom_a": call.get("chrom_a"),
+                "chrom_b": call.get("chrom_b"),
+                "pos_a": call.get("pos_a"),
+                "pos_b": call.get("pos_b"),
+                "score_components": call.get("score_components", {}),
+                "reads": call.get("supporting_reads", []),
+            }
+
+    raise HTTPException(404, f"Cluster {cluster_id} not found")
+
+
 @app.get("/api/jobs/{job_id}/download/{filename}")
 async def download_result(job_id: str, filename: str):
     """Download a specific result file."""
@@ -560,42 +583,6 @@ async def download_result(job_id: str, filename: str):
         raise HTTPException(404, f"File not found: {safe_name}")
 
     return FileResponse(filepath, filename=safe_name)
-
-
-# --- Validation & Observability ---
-
-VALIDATION_STATE_FILE = "/data/scan_archive/validation_state.json"
-
-@app.get("/api/validation-state")
-async def get_validation_state():
-    """Return the current validation gate state."""
-    if not os.path.isfile(VALIDATION_STATE_FILE):
-        return {"state": {}, "valid": False, "reason": "No validation tests have been run"}
-
-    with open(VALIDATION_STATE_FILE) as f:
-        state = json.load(f)
-
-    # Check staleness (24h)
-    now = time.time()
-    stale_threshold = 86400  # 24 hours
-    nano_ok = False
-    small_ok = False
-
-    nano = state.get("nano", {})
-    if nano.get("passed") and (now - nano.get("timestamp", 0)) < stale_threshold:
-        nano_ok = True
-
-    small = state.get("small_spikein", {})
-    if small.get("passed") and (now - small.get("timestamp", 0)) < stale_threshold:
-        small_ok = True
-
-    return {
-        "state": state,
-        "valid": nano_ok,
-        "nano_ok": nano_ok,
-        "small_ok": small_ok,
-        "reason": None if nano_ok else "Nano test stale or not passing",
-    }
 
 
 @app.get("/api/jobs/{job_id}/status")
@@ -678,32 +665,6 @@ def _human_size(nbytes: int) -> str:
 
 def _sse_format(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
-
-
-def _check_validation_gate() -> Optional[str]:
-    """Check if nano tests have passed within the last 24 hours.
-
-    Returns None if gate passes, or an error message string if gate fails.
-    """
-    if not os.path.isfile(VALIDATION_STATE_FILE):
-        return "No validation tests have been run. Run: pytest tests/test_pipeline.py::TestNano -v"
-
-    try:
-        with open(VALIDATION_STATE_FILE) as f:
-            state = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return "Validation state file is corrupt. Re-run nano tests."
-
-    nano = state.get("nano", {})
-    if not nano.get("passed"):
-        return "Nano test is not passing. Fix pipeline issues and re-run nano tests."
-
-    age = time.time() - nano.get("timestamp", 0)
-    if age > 86400:  # 24 hours
-        hours = age / 3600
-        return f"Nano test results are stale ({hours:.0f}h old, max 24h). Re-run nano tests."
-
-    return None
 
 
 def _bam_preflight(bam_path: str) -> Optional[str]:

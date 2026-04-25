@@ -1174,6 +1174,65 @@ class SVExtractor:
         }
 
     # ------------------------------------------------------------------
+    # Intermediate file output
+    # ------------------------------------------------------------------
+
+    def write_intermediates(self, output_dir: str) -> dict[str, str]:
+        """Write extraction intermediates to TSV/JSON files.
+
+        Returns a dict mapping file type to file path.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        files: dict[str, str] = {}
+
+        # 1. Discordant pairs TSV
+        disc_path = os.path.join(output_dir, "discordant_pairs.tsv")
+        cols = ["read_name_hash", "chrom", "pos", "mapq", "mate_chrom",
+                "mate_pos", "is_reverse", "mate_is_reverse", "flag"]
+        with open(disc_path, "w") as f:
+            f.write("\t".join(cols) + "\n")
+            for r in self._discordant_reads:
+                f.write("\t".join([
+                    str(r.read_name_hash), r.chrom, str(r.pos), str(r.mapq),
+                    str(r.mate_chrom or ""), str(r.mate_pos or 0),
+                    str(r.is_reverse), str(r.mate_is_reverse), str(r.flag),
+                ]) + "\n")
+        files["discordant_pairs"] = disc_path
+
+        # 2. Per-chrom pair counts TSV
+        pairs_path = os.path.join(output_dir, "per_chrom_pair_counts.tsv")
+        with open(pairs_path, "w") as f:
+            f.write("chrom_a\tchrom_b\tcount\n")
+            for (ca, cb), cnt in sorted(
+                self._pair_density.items(), key=lambda x: -x[1]
+            ):
+                f.write(f"{ca}\t{cb}\t{cnt}\n")
+        files["per_chrom_pair_counts"] = pairs_path
+
+        # 3. Extraction summary JSON
+        import json as _json
+        summary_path = os.path.join(output_dir, "extraction_summary.json")
+        total_reads = sum(p.reads_processed for p in self._chrom_progress.values())
+        summary = {
+            "total_reads": total_reads,
+            "discordant_count": len(self._discordant_reads),
+            "split_count": len(self._split_reads),
+            "clip_pileup_count": len(self._clip_pileups),
+            "library_stats": {
+                "median": getattr(self._library_stats, "median", 0),
+                "std": getattr(self._library_stats, "std", 0),
+                "n_sampled": getattr(self._library_stats, "n_sampled", 0),
+            },
+            "chrom_lengths": dict(self._chrom_lengths),
+        }
+        with open(summary_path, "w") as f:
+            _json.dump(summary, f, indent=2)
+        files["extraction_summary"] = summary_path
+
+        logger.info("Wrote extraction intermediates to %s", output_dir)
+        return files
+
+    # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 

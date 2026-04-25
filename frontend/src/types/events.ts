@@ -108,6 +108,23 @@ export interface ErrorEvent {
   message: string;
 }
 
+export interface ChromPairMatrixEvent {
+  type: 'chrom_pair.matrix';
+  job_id: string;
+  matrix: number[][];
+  chrom_order: string[];
+  top_pairs: Array<{ chrom_a: string; chrom_b: string; count: number }>;
+}
+
+export interface ClusteringScaleEvent {
+  type: 'clustering.scale';
+  chrom_a: string;
+  chrom_b: string;
+  scale_bp: number;
+  surviving_reads: number;
+  reads_before: number;
+}
+
 export type SSEEvent =
   | ScanStartedEvent
   | StageChangedEvent
@@ -123,7 +140,9 @@ export type SSEEvent =
   | ValidationCallEmittedEvent
   | ValidationCompletedEvent
   | ScanCancelledEvent
-  | ErrorEvent;
+  | ErrorEvent
+  | ChromPairMatrixEvent
+  | ClusteringScaleEvent;
 
 export interface ValidatedCall {
   event_id: string;

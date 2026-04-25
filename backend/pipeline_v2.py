@@ -135,6 +135,9 @@ class PipelineV2:
             self._check_time_budget("extraction", dt)
             self._check_cancel()
 
+            # Stage 1b: Chromosome pair matrix (visible before clustering)
+            self._stage_chrom_pair_matrix()
+
             # Stage 2: Clustering (bin map + promotion + refinement)
             t0 = time.time()
             clusters = self._stage_clustering()
@@ -162,21 +165,6 @@ class PipelineV2:
             self._check_cancel()
 
             # ==========================================
-            # TRACK 2: EXTERNAL CALLER VALIDATION
-            # ==========================================
-            t0 = time.time()
-            external_bnds = self._stage_external_callers()
-            dt = time.time() - t0
-            self._report_data["timings"]["external_callers"] = round(dt, 1)
-            # No time budget check here — DELLY has its own subprocess timeout
-            # and returns empty results on timeout (non-fatal)
-            if dt > self._DELLY_TIMEOUT:
-                self._log("external_callers took %.0fs (DELLY timed out, continuing without)", dt,
-                          level=logging.WARNING)
-            self._match_external_calls(clusters, external_bnds)
-            self._check_cancel()
-
-            # ==========================================
             # SCORING & FILTERING
             # ==========================================
 
@@ -199,6 +187,17 @@ class PipelineV2:
                 for flag in c.filter_flags:
                     fb[flag] += 1
             self._report_data["filter_breakdown"] = dict(fb)
+            self._check_cancel()
+
+            # ==========================================
+            # TRACK 2: EXTERNAL CALLER VALIDATION
+            # (runs AFTER filtering — results are additive only)
+            # ==========================================
+            t0 = time.time()
+            external_bnds = self._stage_external_callers()
+            dt = time.time() - t0
+            self._report_data["timings"]["external_callers"] = round(dt, 1)
+            self._match_external_calls(clusters, external_bnds)
             self._check_cancel()
 
             # Stage 7: Breakpoint window aggregation
@@ -358,6 +357,83 @@ class PipelineV2:
         self.job.clip_count = sum(p.depth for p in self._clip_pileups)
         self.job.total_reads = self.job.reads_processed
         self._debug_evidence = result.get("debug_evidence", [])
+        self._pair_density = result.get("pair_density", {})
+
+        # Write extraction intermediates
+        try:
+            intermediates_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', 'results',
+                self.job.job_id, 'intermediates'
+            )
+            extractor.write_intermediates(intermediates_dir)
+        except Exception:
+            self._log("Failed to write extraction intermediates (non-fatal)",
+                       level=logging.WARNING)
+
+    # ------------------------------------------------------------------
+    # Stage 1b: Chromosome pair matrix
+    # ------------------------------------------------------------------
+
+    def _stage_chrom_pair_matrix(self):
+        """Build and emit a 24×24 canonical chrom-pair density matrix."""
+        chrom_order = []
+        for i in range(1, 23):
+            chrom_order.append(str(i))
+        chrom_order.extend(["X", "Y"])
+
+        # Also accept chr-prefixed names
+        chrom_to_idx = {}
+        for idx, c in enumerate(chrom_order):
+            chrom_to_idx[c] = idx
+            chrom_to_idx[f"chr{c}"] = idx
+
+        n = len(chrom_order)
+        matrix = [[0] * n for _ in range(n)]
+
+        for (ca, cb), count in self._pair_density.items():
+            ia = chrom_to_idx.get(ca)
+            ib = chrom_to_idx.get(cb)
+            if ia is not None and ib is not None:
+                matrix[ia][ib] += count
+                if ia != ib:
+                    matrix[ib][ia] += count
+
+        # Top-N pairs by count
+        top_pairs = sorted(
+            ((ca, cb, cnt) for (ca, cb), cnt in self._pair_density.items() if cnt > 0),
+            key=lambda x: -x[2],
+        )[:20]
+
+        self.emit({
+            "type": "chrom_pair.matrix",
+            "job_id": self.job.job_id,
+            "matrix": matrix,
+            "chrom_order": chrom_order,
+            "top_pairs": [
+                {"chrom_a": ca, "chrom_b": cb, "count": cnt}
+                for ca, cb, cnt in top_pairs
+            ],
+        })
+
+        # Write matrix TSV intermediate
+        try:
+            intermediates_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', 'results',
+                self.job.job_id, 'intermediates'
+            )
+            os.makedirs(intermediates_dir, exist_ok=True)
+            matrix_path = os.path.join(intermediates_dir, "chrom_pair_matrix.tsv")
+            with open(matrix_path, "w") as f:
+                f.write("\t" + "\t".join(chrom_order) + "\n")
+                for idx, row in enumerate(matrix):
+                    f.write(chrom_order[idx] + "\t" + "\t".join(str(v) for v in row) + "\n")
+        except Exception:
+            self._log("Failed to write chrom pair matrix (non-fatal)",
+                       level=logging.WARNING)
+
+        self._log("Chrom pair matrix: %d non-zero pairs, top pair %s",
+                   sum(1 for r in matrix for v in r if v > 0),
+                   f"{top_pairs[0][0]}-{top_pairs[0][1]}={top_pairs[0][2]}" if top_pairs else "none")
 
     # ------------------------------------------------------------------
     # Stage 2: Clustering
@@ -367,18 +443,31 @@ class PipelineV2:
         self.job.stage = ScanStage.CLUSTERING
         self.emit({"type": "scan.stage_changed", "stage": "clustering"})
 
-        from clustering import ClusterEngine
-        engine = ClusterEngine(
-            merge_distance=self.settings.get("merge_distance", 500),
+        from clustering import MultiScaleClusterEngine
+        engine = MultiScaleClusterEngine(
+            final_merge_distance=self.settings.get("merge_distance", 500),
             min_cluster_support=self.settings.get("min_cluster_support", 3),
         )
-        return engine.cluster(
+        clusters = engine.cluster(
             self._discordant_reads,
             self._split_reads,
             self._clip_pileups,
             callback=self.emit,
             cancel_event=self._cancel_event,
         )
+
+        # Write cascade log intermediate
+        try:
+            intermediates_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', 'results',
+                self.job.job_id, 'intermediates'
+            )
+            engine.write_cascade_log(intermediates_dir)
+        except Exception:
+            self._log("Failed to write cascade log (non-fatal)",
+                       level=logging.WARNING)
+
+        return clusters
 
     # ------------------------------------------------------------------
     # Stage 3: Clip realignment (same as v1)
@@ -501,16 +590,16 @@ class PipelineV2:
 
         self._log("Built annotation index: %d bins, %d chrom pair types", len(disc_bin_index), len(pair_counts))
 
-        # Promiscuous loci: positions appearing in >N clusters
-        side_a_counts: dict[tuple[str, int], int] = defaultdict(int)
-        side_b_counts: dict[tuple[str, int], int] = defaultdict(int)
+        # Promiscuous loci: loci linking to >= N distinct partner chromosomes
+        # Index: (chrom, 10kb_bin) -> set(partner_chroms)
+        locus_partners: dict[tuple[str, int], set[str]] = defaultdict(set)
         for c in clusters:
             bin_a = c.pos_a // 10000
             bin_b = c.pos_b // 10000
-            side_a_counts[(c.chrom_a, bin_a)] += 1
-            side_b_counts[(c.chrom_b, bin_b)] += 1
+            locus_partners[(c.chrom_a, bin_a)].add(c.chrom_b)
+            locus_partners[(c.chrom_b, bin_b)].add(c.chrom_a)
 
-        promiscuous_threshold = self.settings.get("promiscuous_threshold", 5)
+        promiscuous_threshold = self.settings.get("promiscuous_threshold", 3)
 
         for c in clusters:
             # Duplicate fraction
@@ -551,11 +640,12 @@ class PipelineV2:
                     orient_dist[sa + sb] += 1
                 c.orientation_distribution = dict(orient_dist)
 
-            # Promiscuous hotspot
+            # Promiscuous hotspot: locus links to >=N distinct partner chromosomes
             bin_a = c.pos_a // 10000
             bin_b = c.pos_b // 10000
-            if (side_a_counts.get((c.chrom_a, bin_a), 0) > promiscuous_threshold
-                    or side_b_counts.get((c.chrom_b, bin_b), 0) > promiscuous_threshold):
+            partners_a = len(locus_partners.get((c.chrom_a, bin_a), set()))
+            partners_b = len(locus_partners.get((c.chrom_b, bin_b), set()))
+            if partners_a >= promiscuous_threshold or partners_b >= promiscuous_threshold:
                 c.promiscuous_hotspot = True
 
         self._log("Annotated %d clusters", len(clusters))
@@ -579,6 +669,7 @@ class PipelineV2:
 
         if self.settings.get("skip_external_callers", False):
             self._log("External callers skipped by settings")
+            self._report_data["delly_status"] = "skipped"
             return []
 
         self.emit({"type": "scan.substage", "stage": "external_callers",
@@ -600,10 +691,10 @@ class PipelineV2:
           - Strict timeout enforcement
         """
         if not shutil.which("delly"):
-            raise RuntimeError(
-                "DELLY not found on PATH. Install DELLY or add to PATH. "
-                "External caller validation requires DELLY."
-            )
+            self._log("DELLY not found on PATH — continuing without external validation",
+                       level=logging.WARNING)
+            self._report_data["delly_status"] = "skipped"
+            return []
 
         input_bam = self.job.file_path
         # Auto-detect exclude.bed based on reference chromosome naming
@@ -616,11 +707,10 @@ class PipelineV2:
 
         # Verify exclude.bed exists
         if not os.path.isfile(exclude_bed):
-            raise RuntimeError(
-                f"exclude.bed not found at {exclude_bed}. "
-                f"Generate it from the reference .fai: all non-primary contigs. "
-                f"DELLY cannot run without it (3342 alt contigs would take hours)."
-            )
+            self._log("exclude.bed not found at %s — cannot run DELLY", exclude_bed,
+                       level=logging.WARNING)
+            self._report_data["delly_status"] = "skipped"
+            return []
 
         with tempfile.NamedTemporaryFile(suffix=".bcf", delete=False) as tmp:
             out_path = tmp.name
@@ -670,26 +760,29 @@ class PipelineV2:
                     pass
 
             self._log("DELLY: %d interchromosomal BNDs parsed", len(bnds))
+            self._report_data["delly_status"] = "completed"
             return bnds
 
         except subprocess.TimeoutExpired:
             self._log("DELLY TIMEOUT after %ds — continuing without DELLY corroboration",
                        self._DELLY_TIMEOUT, level=logging.WARNING)
+            self._report_data["delly_status"] = "timeout"
             try:
                 os.unlink(out_path)
             except OSError:
                 pass
-            # Non-fatal: Track 1 results are still valid without DELLY
             return []
 
         except subprocess.CalledProcessError as e:
             stderr = e.stderr.decode("utf-8", errors="replace")[:1000] if e.stderr else ""
-            self._log("DELLY failed (exit %s): %s", e.returncode, stderr, level=logging.ERROR)
+            self._log("DELLY failed (exit %s): %s — continuing without DELLY",
+                       e.returncode, stderr, level=logging.WARNING)
+            self._report_data["delly_status"] = "error"
             try:
                 os.unlink(out_path)
             except OSError:
                 pass
-            raise RuntimeError(f"DELLY failed with exit code {e.returncode}: {stderr[:200]}")
+            return []
 
     @staticmethod
     def _parse_bnd_vcf(vcf_path: str, caller: str) -> list[dict]:
@@ -902,40 +995,82 @@ class PipelineV2:
     def _compute_scores(self, clusters: list[EvidenceCluster]) -> None:
         """Compute a composite score for each cluster.
 
-        Score components (all non-negative):
-          - support_pr: log2(PR+1) * 5              (discordant pair count)
-          - support_sr: log2(SR+1) * 10             (split read count, 2x weight)
-          - support_clip: log2(clip+1) * 2
-          - pvalue_a: -log10(pval_a) capped at 20   (statistical significance side A)
-          - pvalue_b: -log10(pval_b) capped at 20   (statistical significance side B)
-          - unique_starts: min(unique_starts_a, unique_starts_b) * 0.5
-          - reciprocal: 10 if reciprocal_support > 0 else 0
-          - external: 15 * len(external_callers)
-          - mapq: median_mapq * 0.2
+        Every cluster gets a fully-reconstructible score_components dict.
         """
         import math
         for c in clusters:
             if c.tier == Tier.FILTERED:
                 c.score = 0.0
+                c.score_components = {"filtered": True}
                 continue
 
             comps = {}
+            # Support counts (log-scaled)
             comps["support_pr"] = round(math.log2(c.discordant_count + 1) * 5, 1)
             comps["support_sr"] = round(math.log2(c.split_count + 1) * 10, 1)
             comps["support_clip"] = round(math.log2(c.clipped_count + 1) * 2, 1)
 
+            # Statistical significance per side
             pa = max(c.local_nb_pvalue_a, 1e-300)
             pb = max(c.local_nb_pvalue_b, 1e-300)
             comps["pvalue_a"] = round(min(-math.log10(pa), 20), 1)
             comps["pvalue_b"] = round(min(-math.log10(pb), 20), 1)
 
+            # Unique start positions
             comps["unique_starts"] = round(min(c.unique_starts_a, c.unique_starts_b) * 0.5, 1)
+
+            # Cluster tightness (position spread on each side)
+            tightness_a = 0
+            tightness_b = 0
+            if c.reads:
+                positions_a = [r.pos_a for r in c.reads]
+                positions_b = [r.pos_b for r in c.reads]
+                tightness_a = max(positions_a) - min(positions_a) if positions_a else 0
+                tightness_b = max(positions_b) - min(positions_b) if positions_b else 0
+            comps["cluster_tightness_a"] = tightness_a
+            comps["cluster_tightness_b"] = tightness_b
+            # Bonus for tight clusters (< 1kb spread)
+            tightness_bonus = 0.0
+            if tightness_a < 1000 and tightness_b < 1000 and c.total_support >= 3:
+                tightness_bonus = 5.0
+            comps["tightness_bonus"] = tightness_bonus
+
+            # Enrichment over background
+            comps["enrichment_over_bg"] = round(min(c.chrom_pair_enrichment * 0.5, 10.0), 1)
+
+            # Reciprocal support
             comps["reciprocal"] = 10.0 if c.reciprocal_support > 0 else 0.0
+
+            # External callers
             comps["external"] = round(15.0 * len(c.external_callers), 1)
+
+            # MAPQ
             comps["mapq"] = round(c.median_mapq * 0.2, 1)
 
+            # Duplicate fraction penalty
+            dup_penalty = 0.0
+            if c.duplicate_fraction > 0.5:
+                dup_penalty = -5.0
+            comps["dup_penalty"] = dup_penalty
+
+            # Promiscuous penalty
+            promiscuous_penalty = -10.0 if c.promiscuous_hotspot else 0.0
+            comps["promiscuous_penalty"] = promiscuous_penalty
+
+            # Raw inputs for audit
+            comps["_raw_support_count"] = c.total_support
+            comps["_raw_unique_starts_a"] = c.unique_starts_a
+            comps["_raw_unique_starts_b"] = c.unique_starts_b
+            comps["_raw_dup_fraction"] = round(c.duplicate_fraction, 3)
+            comps["_raw_median_mapq"] = round(c.median_mapq, 1)
+
             c.score_components = comps
-            c.score = round(sum(comps.values()), 1)
+            # Score = sum of scoring components (exclude raw audit fields)
+            c.score = round(sum(
+                v for k, v in comps.items()
+                if isinstance(v, (int, float)) and not k.startswith("_")
+                and k not in ("cluster_tightness_a", "cluster_tightness_b")
+            ), 1)
 
     # ------------------------------------------------------------------
     # Stage 8: Output
@@ -954,6 +1089,31 @@ class PipelineV2:
         from output_writer import OutputWriter
         writer = OutputWriter(results_dir, self.job.reference_build)
         writer.write_all(self.job, clusters, self._chrom_lengths)
+
+        # Write per-cluster evidence files for the evidence browser API
+        import json as _json
+        evidence_dir = os.path.join(results_dir, 'evidence')
+        os.makedirs(evidence_dir, exist_ok=True)
+        for c in clusters:
+            if c.tier.value == "filtered" or not c.cluster_id:
+                continue
+            try:
+                evidence_data = {
+                    "cluster_id": c.cluster_id,
+                    "chrom_a": c.chrom_a,
+                    "chrom_b": c.chrom_b,
+                    "pos_a": c.pos_a,
+                    "pos_b": c.pos_b,
+                    "orientation": c.orientation,
+                    "score_components": c.score_components,
+                    "supporting_reads": c.reads_to_dicts(),
+                }
+                path = os.path.join(evidence_dir, f"{c.cluster_id}.json")
+                with open(path, "w") as f:
+                    _json.dump(evidence_data, f, indent=2)
+            except Exception:
+                self._log("Failed to write evidence for %s", c.cluster_id,
+                           level=logging.WARNING)
 
         # Write debug evidence
         if self._debug_evidence:

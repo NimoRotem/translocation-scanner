@@ -3,6 +3,7 @@ import type {
   ScanMode, ValidatedCall, ChromData, WaterfallEntry,
   ThroughputEvent, ChromProgressEvent, ChromBinUpdateEvent,
   PairDensityEvent, EvidenceHighlightEvent, SSEEvent,
+  ChromPairMatrixEvent, ClusteringScaleEvent,
 } from '../types/events';
 
 const CHROMS = [
@@ -38,6 +39,15 @@ interface ThroughputSnapshot {
   bytes_per_sec: number;
   discordant_per_sec: number;
   split_per_sec: number;
+}
+
+interface SSEDebugState {
+  connected: boolean;
+  jobId: string | null;
+  lastEventType: string;
+  lastEventTime: number;
+  eventCount: number;
+  errors: Array<{ time: number; message: string }>;
 }
 
 interface ScanState {
@@ -83,10 +93,14 @@ interface ScanState {
   readsProcessed: number;
   bytesProcessed: number;
 
+  // SSE debug state
+  sseDebug: SSEDebugState;
+
   // Actions
   handleEvent: (event: SSEEvent) => void;
   reset: () => void;
   startScan: (jobId: string) => void;
+  setSSEDebug: (patch: Partial<SSEDebugState>) => void;
 }
 
 const initialDensity = (): number[][] =>
@@ -118,6 +132,11 @@ export const useScanStore = create<ScanState>((set, get) => ({
   overallPct: 0,
   readsProcessed: 0,
   bytesProcessed: 0,
+  sseDebug: { connected: false, jobId: null, lastEventType: '', lastEventTime: 0, eventCount: 0, errors: [] },
+
+  setSSEDebug: (patch: Partial<SSEDebugState>) => set(s => ({
+    sseDebug: { ...s.sseDebug, ...patch },
+  })),
 
   startScan: (jobId: string) => set({
     mode: 'streaming',
@@ -308,6 +327,21 @@ export const useScanStore = create<ScanState>((set, get) => ({
       case 'error':
         set({ error: event.message, stage: 'failed' });
         break;
+
+      case 'chrom_pair.matrix': {
+        // Full matrix update from Phase 1.2
+        const matrixEvt = event as ChromPairMatrixEvent;
+        if (matrixEvt.matrix && matrixEvt.matrix.length === 24) {
+          set({ densityMatrix: matrixEvt.matrix });
+        }
+        break;
+      }
+
+      case 'clustering.scale': {
+        // Multi-scale clustering progress from Phase 1.3
+        // Just update the stage detail — the density matrix already shows the data
+        break;
+      }
     }
   },
 }));

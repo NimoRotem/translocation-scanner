@@ -36,23 +36,6 @@ FULL_BAM = "/data/aligned_bams/Nimo.bam"
 REF_NUMERIC = "/data/genom-nimo/reference.fasta"
 REF_CHR = "/data/refs/hs38DH.fa"
 
-VALIDATION_STATE_FILE = "/data/scan_archive/validation_state.json"
-
-
-def _get_git_sha() -> str:
-    """Get current git SHA for validation tracking."""
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True,
-            cwd=os.path.join(os.path.dirname(__file__), "..", ".."),
-        )
-        return result.stdout.strip() if result.returncode == 0 else "unknown"
-    except Exception:
-        return "unknown"
-
-
 def _run_pipeline(
     bam_path: str,
     reference_path: str,
@@ -89,28 +72,6 @@ def _run_pipeline(
     return job, events
 
 
-def _save_validation_state(test_name: str, passed: bool, details: dict):
-    """Record test result for validation gate enforcement."""
-    state = {}
-    if os.path.isfile(VALIDATION_STATE_FILE):
-        try:
-            with open(VALIDATION_STATE_FILE) as f:
-                state = json.load(f)
-        except Exception:
-            pass
-
-    state[test_name] = {
-        "passed": passed,
-        "timestamp": time.time(),
-        "git_sha": _get_git_sha(),
-        "details": details,
-    }
-
-    os.makedirs(os.path.dirname(VALIDATION_STATE_FILE), exist_ok=True)
-    with open(VALIDATION_STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
 # ---------------------------------------------------------------------------
 # Nano tests (<60s)
 # ---------------------------------------------------------------------------
@@ -135,13 +96,6 @@ class TestNano:
             f"Nano test took {elapsed:.1f}s, budget is {self.TIME_BUDGET}s"
         )
 
-        # Record validation state
-        _save_validation_state("nano", True, {
-            "elapsed": round(elapsed, 1),
-            "discordant": job.discordant_count,
-            "split": job.split_count,
-            "status": job.status.value,
-        })
 
     def test_no_silent_failures(self):
         """No stages should be silently skipped."""
@@ -181,10 +135,6 @@ class TestNano:
         delly_time = timings.get("external_callers", 0)
         print(f"DELLY time on nano: {delly_time:.1f}s")
 
-        _save_validation_state("nano_delly", True, {
-            "elapsed": round(elapsed, 1),
-            "delly_time": round(delly_time, 1),
-        })
 
 
 # ---------------------------------------------------------------------------
@@ -217,12 +167,6 @@ class TestSmall:
             c for c in calls
             if c.get("tier") in ("confirmed", "validated", "likely")
         ]
-
-        _save_validation_state("small_spikein", len(high_tier) >= 5, {
-            "elapsed": round(elapsed, 1),
-            "high_tier_calls": len(high_tier),
-            "total_calls": len(calls),
-        })
 
         assert len(high_tier) >= 5, (
             f"Expected >=5 spike-in events at likely+, got {len(high_tier)}"
@@ -263,11 +207,6 @@ class TestFull:
         timings = job.settings.get("_report", {}).get("timings", {})
         print(f"Full Nimo timings: {json.dumps(timings, indent=2)}")
 
-        _save_validation_state("full_nimo", True, {
-            "elapsed": round(elapsed, 1),
-            "timings": timings,
-            "calls": len(job.validated_calls),
-        })
 
 
 # ---------------------------------------------------------------------------

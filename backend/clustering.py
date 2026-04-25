@@ -19,6 +19,7 @@ Algorithm overview:
 from __future__ import annotations
 
 import logging
+import os
 import resource
 import time
 from collections import defaultdict
@@ -839,6 +840,282 @@ class ClusterEngine:
                 callback(event)
             except Exception:
                 logger.warning("Clustering callback raised an exception", exc_info=True)
+
+
+class MultiScaleClusterEngine:
+    """Multi-scale cascade clustering for blind translocation discovery.
+
+    Algorithm per canonical (chrom_a, chrom_b) pair:
+      1. Bin all interchromosomal reads at 1Mb; keep bins with count >= min_count
+      2. Re-bin surviving reads at 100kb; keep bins with count >= min_count
+      3. Re-bin at 10kb; keep bins with count >= min_count
+      4. Re-bin at 1kb; keep bins with count >= min_count
+      5. Position-merge surviving reads at final_merge_distance (100bp)
+      6. Convert to EvidenceCluster objects
+
+    Reuses _RawCluster, _to_evidence_clusters, and _annotate_reciprocal
+    from ClusterEngine.
+    """
+
+    # Scale cascade: (bin_size_bp, min_reads_per_bin)
+    _SCALES = [
+        (1_000_000, 2),
+        (100_000, 2),
+        (10_000, 2),
+        (1_000, 2),
+    ]
+
+    def __init__(
+        self,
+        final_merge_distance: int = 100,
+        min_cluster_support: int = 3,
+        scales: list[tuple[int, int]] | None = None,
+    ) -> None:
+        self.final_merge_distance = final_merge_distance
+        self._min_cluster_support = min_cluster_support
+        if scales is not None:
+            self._SCALES = scales
+        # Reuse ClusterEngine for _to_evidence_clusters and _annotate_reciprocal
+        self._converter = ClusterEngine(
+            merge_distance=final_merge_distance,
+            min_cluster_support=min_cluster_support,
+        )
+
+    def cluster(
+        self,
+        discordant_reads: list[SVRead],
+        split_reads: list[SVRead],
+        clip_pileups: list[ClipPileup],
+        callback: Optional[Callable[[dict], None]] = None,
+        cancel_event: Optional[object] = None,
+    ) -> list[EvidenceCluster]:
+        """Run the multi-scale clustering pipeline."""
+        t_total = time.monotonic()
+
+        self._emit(callback, {
+            "type": "scan.stage_changed",
+            "stage": "clustering",
+        })
+
+        all_reads = discordant_reads + split_reads
+        logger.info(
+            "MultiScale clustering input: %d discordant, %d split, %d clip pileups",
+            len(discordant_reads), len(split_reads), len(clip_pileups),
+        )
+
+        def _check_cancel():
+            if cancel_event is not None and hasattr(cancel_event, 'is_set') and cancel_event.is_set():
+                raise RuntimeError("Clustering cancelled")
+
+        # Group reads by canonical chrom pair
+        pair_buckets: dict[tuple[str, str], list[SVRead]] = defaultdict(list)
+        for read in all_reads:
+            if read.mate_chrom is None or read.mate_pos is None:
+                continue
+            canon_a, canon_b = _canonical_pair(read.chrom, read.mate_chrom)
+            pair_buckets[(canon_a, canon_b)].append(read)
+
+        logger.info("MultiScale: %d canonical chrom pairs with reads", len(pair_buckets))
+        self._emit(callback, {
+            "type": "scan.progress",
+            "stage": "clustering",
+            "pct": 5,
+            "detail": f"Grouped reads into {len(pair_buckets)} chromosome pairs",
+        })
+
+        # Cascade data for intermediate output
+        cascade_log: list[dict] = []
+
+        # Run multi-scale cascade per chrom pair
+        surviving_reads: list[SVRead] = []
+        pair_idx = 0
+        total_pairs = len(pair_buckets)
+
+        for (chrom_a, chrom_b), reads in pair_buckets.items():
+            pair_idx += 1
+            _check_cancel()
+
+            pair_surviving = reads  # start with all reads for this pair
+            pair_cascade: dict = {
+                "chrom_a": chrom_a, "chrom_b": chrom_b,
+                "input_reads": len(reads), "scales": [],
+            }
+
+            for scale_bp, min_count in self._SCALES:
+                before = len(pair_surviving)
+                pair_surviving = self._filter_at_scale(
+                    pair_surviving, chrom_a, chrom_b, scale_bp, min_count,
+                )
+                after = len(pair_surviving)
+
+                pair_cascade["scales"].append({
+                    "scale_bp": scale_bp,
+                    "min_count": min_count,
+                    "reads_before": before,
+                    "reads_after": after,
+                })
+
+                # Emit per-scale progress
+                self._emit(callback, {
+                    "type": "clustering.scale",
+                    "chrom_a": chrom_a,
+                    "chrom_b": chrom_b,
+                    "scale_bp": scale_bp,
+                    "surviving_reads": after,
+                    "reads_before": before,
+                })
+
+                if after == 0:
+                    break
+
+            cascade_log.append(pair_cascade)
+            surviving_reads.extend(pair_surviving)
+
+            # Progress
+            if total_pairs > 0:
+                pct = 5 + int(65 * pair_idx / total_pairs)
+                if pair_idx % max(1, total_pairs // 20) == 0 or pair_idx == total_pairs:
+                    self._emit(callback, {
+                        "type": "scan.progress",
+                        "stage": "clustering",
+                        "pct": pct,
+                        "detail": f"Cascade filtering: {pair_idx}/{total_pairs} pairs, "
+                                  f"{len(surviving_reads)} reads surviving",
+                    })
+
+        logger.info(
+            "MultiScale cascade: %d -> %d reads survived all scales",
+            len(all_reads), len(surviving_reads),
+        )
+
+        # Now do final position-merge using the existing ClusterEngine logic
+        self._emit(callback, {
+            "type": "scan.progress",
+            "stage": "clustering",
+            "pct": 72,
+            "detail": f"Position-merging {len(surviving_reads)} surviving reads",
+        })
+        _check_cancel()
+
+        # Group surviving reads by (pair, orientation) and merge
+        t0 = time.monotonic()
+        raw_clusters = self._converter._group_and_merge(
+            surviving_reads,
+            EvidenceType.DISCORDANT,  # mixed types, but merge logic is the same
+            self.final_merge_distance,
+            cancel_event=cancel_event,
+        )
+        logger.info(
+            "Final merge: %.2fs -> %d raw clusters",
+            time.monotonic() - t0, len(raw_clusters),
+        )
+
+        # Also cluster clip pileups separately
+        clip_clusters = self._converter._build_clip_clusters(clip_pileups)
+
+        # Prune small clusters
+        all_raw = raw_clusters + clip_clusters
+        if self._min_cluster_support > 1:
+            all_raw = [
+                rc for rc in all_raw
+                if len(rc.positions_a) >= self._min_cluster_support
+            ]
+
+        # Cross-merge across evidence types
+        merged = self._converter._cross_merge(all_raw)
+        self._emit(callback, {
+            "type": "scan.progress",
+            "stage": "clustering",
+            "pct": 85,
+            "detail": f"Cross-merged into {len(merged)} unified clusters",
+        })
+        _check_cancel()
+
+        # Convert to EvidenceCluster objects
+        evidence_clusters = self._converter._to_evidence_clusters(merged)
+
+        # Reciprocal support
+        self._converter._annotate_reciprocal(evidence_clusters)
+
+        # Sort and assign IDs
+        evidence_clusters.sort(key=lambda c: c.total_support, reverse=True)
+        for idx, cluster in enumerate(evidence_clusters, start=1):
+            cluster.cluster_id = f"CLU_{idx:03d}"
+
+        self._emit(callback, {
+            "type": "scan.progress",
+            "stage": "clustering",
+            "pct": 100,
+            "detail": f"Clustering complete: {len(evidence_clusters)} clusters",
+        })
+
+        # Store cascade log for intermediate output
+        self._cascade_log = cascade_log
+
+        try:
+            peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        except Exception:
+            peak_mb = 0
+        logger.info(
+            "MultiScale clustering total: %.2fs, %d final clusters, peak RSS %.0f MB",
+            time.monotonic() - t_total, len(evidence_clusters), peak_mb,
+        )
+        return evidence_clusters
+
+    def write_cascade_log(self, output_dir: str) -> str:
+        """Write the cascade filtering log to JSON."""
+        import json as _json
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "clustering_cascade.json")
+        with open(path, "w") as f:
+            _json.dump(getattr(self, '_cascade_log', []), f, indent=2)
+        return path
+
+    @staticmethod
+    def _filter_at_scale(
+        reads: list[SVRead],
+        chrom_a: str,
+        chrom_b: str,
+        scale_bp: int,
+        min_count: int,
+    ) -> list[SVRead]:
+        """Bin reads at a given scale and keep only bins meeting min_count."""
+        if not reads:
+            return reads
+
+        # Count reads per 2D bin
+        bin_counts: dict[tuple[int, int], int] = defaultdict(int)
+        read_bins: list[tuple[int, int]] = []
+
+        for read in reads:
+            if read.mate_chrom is None or read.mate_pos is None:
+                read_bins.append((-1, -1))
+                continue
+            # Determine pos_a and pos_b relative to canonical ordering
+            if read.chrom == chrom_a or (read.chrom != chrom_b):
+                pa, pb = read.pos, read.mate_pos
+            else:
+                pa, pb = read.mate_pos, read.pos
+            bin_a = pa // scale_bp
+            bin_b = pb // scale_bp
+            key = (bin_a, bin_b)
+            read_bins.append(key)
+            bin_counts[key] += 1
+
+        # Keep reads in bins that pass threshold
+        passing_bins = {k for k, v in bin_counts.items() if v >= min_count}
+        return [
+            read for read, bk in zip(reads, read_bins)
+            if bk != (-1, -1) and bk in passing_bins
+        ]
+
+    @staticmethod
+    def _emit(callback: Optional[Callable[[dict], None]], event: dict) -> None:
+        if callback is not None:
+            try:
+                callback(event)
+            except Exception:
+                logger.warning("MultiScale callback raised an exception", exc_info=True)
 
 
 # ======================================================================
