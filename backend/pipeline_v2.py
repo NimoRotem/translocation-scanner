@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -44,6 +43,22 @@ class CancelledException(Exception):
 class PipelineV2:
     """Dual-track translocation detection pipeline."""
 
+    # Per-stage wall-clock time budgets (seconds).  When a stage exceeds
+    # its budget, the pipeline logs a warning and continues — hard kills
+    # happen only at the subprocess level (the timeouts on subprocess.run).
+    _STAGE_TIME_BUDGETS: dict[str, int] = {
+        "extraction": 600,        # 10 min
+        "clustering": 120,        # 2 min
+        "clip_realignment": 300,  # 5 min
+        "annotation": 120,        # 2 min
+        "external_callers": 3660, # ~1 hr (delly_call 3600s + manta_call 60s overhead)
+        "background_model": 300,  # 5 min
+        "filtering": 60,          # 1 min
+        "output": 60,             # 1 min
+    }
+    _DELLY_TIMEOUT: int = 3600    # 1 hr cap on DELLY
+    _MANTA_TIMEOUT: int = 3600    # 1 hr cap on Manta
+
     def __init__(self, job: ScanJob, event_callback=None, cancel_event=None):
         self.job = job
         self.emit = event_callback or (lambda e: None)
@@ -59,6 +74,14 @@ class PipelineV2:
     def _check_cancel(self):
         if self._cancel_event is not None and self._cancel_event.is_set():
             raise CancelledException("Scan cancelled by user")
+
+    def _check_time_budget(self, stage: str, elapsed: float):
+        """Fail the job if a stage exceeds its time budget."""
+        budget = self._STAGE_TIME_BUDGETS.get(stage)
+        if budget and elapsed > budget:
+            msg = f"TIME BUDGET EXCEEDED: {stage} took {elapsed:.0f}s (budget {budget}s)"
+            self._log(msg, level=logging.ERROR)
+            raise RuntimeError(msg)
 
     def _setup_job_log(self):
         log_dir = os.path.join(
@@ -107,6 +130,7 @@ class PipelineV2:
             self._report_data["timings"]["extraction"] = round(dt, 1)
             self._log("Extraction: %.1fs — %d disc, %d split",
                        dt, self.job.discordant_count, self.job.split_count)
+            self._check_time_budget("extraction", dt)
             self._check_cancel()
 
             # Stage 2: Clustering (bin map + promotion + refinement)
@@ -116,18 +140,23 @@ class PipelineV2:
             self._report_data["timings"]["clustering"] = round(dt, 1)
             self._report_data.setdefault("cluster_counts", {})["raw_clusters_formed"] = len(clusters)
             self._log("Clustering: %.1fs — %d clusters", dt, len(clusters))
+            self._check_time_budget("clustering", dt)
             self._check_cancel()
 
             # Stage 3: Clip realignment
             t0 = time.time()
             clusters = self._stage_clip_realignment(clusters)
-            self._report_data["timings"]["clip_realignment"] = round(time.time() - t0, 1)
+            dt = time.time() - t0
+            self._report_data["timings"]["clip_realignment"] = round(dt, 1)
+            self._check_time_budget("clip_realignment", dt)
             self._check_cancel()
 
             # Stage 4: Per-cluster annotation
             t0 = time.time()
             self._annotate_clusters(clusters)
-            self._report_data["timings"]["annotation"] = round(time.time() - t0, 1)
+            dt = time.time() - t0
+            self._report_data["timings"]["annotation"] = round(dt, 1)
+            self._check_time_budget("annotation", dt)
             self._check_cancel()
 
             # ==========================================
@@ -135,7 +164,9 @@ class PipelineV2:
             # ==========================================
             t0 = time.time()
             external_bnds = self._stage_external_callers()
-            self._report_data["timings"]["external_callers"] = round(time.time() - t0, 1)
+            dt = time.time() - t0
+            self._report_data["timings"]["external_callers"] = round(dt, 1)
+            self._check_time_budget("external_callers", dt)
             self._match_external_calls(clusters, external_bnds)
             self._check_cancel()
 
@@ -148,6 +179,7 @@ class PipelineV2:
             clusters = self._stage_background_model(clusters)
             dt = time.time() - t0
             self._report_data["timings"]["background_model"] = round(dt, 1)
+            self._check_time_budget("background_model", dt)
             self._check_cancel()
 
             # Stage 6: Hard excludes + reject + tier assignment
@@ -527,7 +559,13 @@ class PipelineV2:
     # ------------------------------------------------------------------
 
     def _stage_external_callers(self) -> list[dict]:
-        """Run Manta/DELLY/GRIDSS and collect interchromosomal BNDs."""
+        """Run Manta/DELLY and collect interchromosomal BNDs.
+
+        The reference FASTA must contain every contig present in the BAM
+        header (use N-filled sequences for alt/decoy contigs).  This
+        eliminates the need for slow primary-BAM subsetting.
+        """
+        self.job.stage = ScanStage.EXTERNAL_CALLERS
         self.emit({"type": "scan.stage_changed", "stage": "external_callers"})
 
         if self.settings.get("skip_external_callers", False):
@@ -536,28 +574,22 @@ class PipelineV2:
 
         bnds = []
 
-        # Create primary-only BAM for DELLY (if BAM has alt/decoy contigs)
-        primary_bam = None
-        try:
-            primary_bam = self._make_primary_bam()
-        except Exception as e:
-            self._log("Failed to create primary BAM: %s", e, level=logging.WARNING)
-
         # Try Manta
+        self.emit({"type": "scan.substage", "stage": "external_callers",
+                    "substage": "manta"})
+        t0 = time.time()
         manta_bnds = self._run_manta()
         bnds.extend(manta_bnds)
+        if manta_bnds or time.time() - t0 > 1:
+            self._log("Manta: %.1fs, %d BNDs", time.time() - t0, len(manta_bnds))
 
-        # Try DELLY
-        delly_bnds = self._run_delly(bam_path=primary_bam)
+        # Try DELLY (runs directly on original BAM — no header surgery needed)
+        self.emit({"type": "scan.substage", "stage": "external_callers",
+                    "substage": "delly"})
+        t0 = time.time()
+        delly_bnds = self._run_delly()
         bnds.extend(delly_bnds)
-
-        # Clean up primary BAM
-        if primary_bam:
-            for p in [primary_bam, primary_bam + ".bai"]:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+        self._log("DELLY: %.1fs, %d BNDs", time.time() - t0, len(delly_bnds))
 
         self._log("External callers: %d total BNDs (%d Manta, %d DELLY)",
                    len(bnds), len(manta_bnds), len(delly_bnds))
@@ -580,7 +612,7 @@ class PipelineV2:
             subprocess.run(cmd_config, check=True, capture_output=True, timeout=120)
 
             cmd_run = [os.path.join(workdir, "runWorkflow.py"), "-j", "4"]
-            subprocess.run(cmd_run, check=True, capture_output=True, timeout=7200)
+            subprocess.run(cmd_run, check=True, capture_output=True, timeout=self._MANTA_TIMEOUT)
 
             # Parse diploidSV VCF
             vcf_path = os.path.join(workdir, "results", "variants", "diploidSV.vcf.gz")
@@ -601,74 +633,18 @@ class PipelineV2:
             self._log("Manta failed: %s", e, level=logging.WARNING)
             return []
 
-    def _make_primary_bam(self) -> str | None:
-        """Create a BAM with only primary-assembly chromosomes.
+    def _run_delly(self) -> list[dict]:
+        """Run DELLY and parse interchromosomal BNDs.
 
-        DELLY validates ALL BAM header contigs against the reference at
-        startup.  When a BAM contains thousands of alt/decoy contigs not
-        in the reference, DELLY refuses to run.  Extracting only the
-        primary chromosomes that exist in the reference solves this.
+        Requires that the reference FASTA contains every contig listed
+        in the BAM header.  Missing contigs should be added as N-filled
+        sequences (see tools/extend_reference.py).
         """
-        ref_chroms = sorted(self._chrom_lengths.keys())
-        if not ref_chroms:
-            return None
-
-        import pysam
-        with pysam.AlignmentFile(self.job.file_path, "rb") as af:
-            bam_chroms = set(af.references)
-
-        extra = bam_chroms - set(ref_chroms)
-        if not extra:
-            return None  # BAM already matches reference
-
-        primary_bam = os.path.join(
-            tempfile.gettempdir(),
-            f"primary_{self.job.job_id}.bam",
-        )
-        self._log("Creating primary-only BAM (%d of %d chroms) for DELLY",
-                   len(ref_chroms), len(bam_chroms))
-
-        # Pipe through SAM text to filter header AND remap reference IDs.
-        # BAM stores reference IDs as integers tied to the header; when we
-        # strip SQ lines, the IDs must be remapped.  Going through SAM
-        # text (which uses chromosome names, not IDs) handles this correctly.
-        # The awk filter drops @SQ lines for non-reference chromosomes.
-        ref_set = set(ref_chroms)
-        # Build awk filter: keep all non-SQ lines; for SQ lines, only keep
-        # those whose SN field is in the reference set.
-        ref_awk_set = "; ".join(f'r["{c}"]=1' for c in ref_chroms)
-        awk_script = (
-            f'BEGIN{{{ref_awk_set}}} '
-            '/^@SQ/{sn=""; for(i=1;i<=NF;i++){if($i~/^SN:/){sn=substr($i,4)}} '
-            'if(!(sn in r))next} {print}'
-        )
-        pipe_cmd = (
-            f'samtools view -h -@ 2 {shlex.quote(self.job.file_path)}'
-            f' {" ".join(shlex.quote(c) for c in ref_chroms)}'
-            f' | awk \'{awk_script}\''
-            f' | samtools view -bS -@ 2 -o {shlex.quote(primary_bam)} -'
-        )
-        subprocess.run(
-            pipe_cmd, shell=True, check=True,
-            capture_output=True, timeout=7200,
-        )
-
-        # Index
-        subprocess.run(
-            ["samtools", "index", "-@", "4", primary_bam],
-            check=True, capture_output=True, timeout=1200,
-        )
-
-        self._log("Primary-only BAM ready: %s", primary_bam)
-        return primary_bam
-
-    def _run_delly(self, bam_path: str | None = None) -> list[dict]:
-        """Run DELLY and parse interchromosomal BNDs."""
         if not shutil.which("delly"):
             self._log("DELLY not installed, skipping", level=logging.WARNING)
             return []
 
-        input_bam = bam_path or self.job.file_path
+        input_bam = self.job.file_path
 
         try:
             with tempfile.NamedTemporaryFile(suffix=".bcf", delete=False) as tmp:
@@ -681,7 +657,7 @@ class PipelineV2:
                 input_bam,
             ]
             self._log("Running DELLY: %s", " ".join(cmd[-3:]))
-            subprocess.run(cmd, check=True, capture_output=True, timeout=7200)
+            subprocess.run(cmd, check=True, capture_output=True, timeout=self._DELLY_TIMEOUT)
 
             # Convert BCF to VCF for parsing
             vcf_path = out_path.replace(".bcf", ".vcf")

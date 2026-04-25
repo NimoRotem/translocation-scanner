@@ -28,6 +28,7 @@ class ScanStage(str, Enum):
     EXTRACTION = "extraction"
     CLUSTERING = "clustering"
     CLIP_REALIGNMENT = "clip_realignment"
+    EXTERNAL_CALLERS = "external_callers"
     BACKGROUND_MODEL = "background_model"
     FILTERING = "filtering"
     SCORING = "scoring"
