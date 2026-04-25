@@ -552,6 +552,83 @@ async def download_result(job_id: str, filename: str):
     return FileResponse(filepath, filename=safe_name)
 
 
+# --- Validation & Observability ---
+
+VALIDATION_STATE_FILE = "/data/scan_archive/validation_state.json"
+
+@app.get("/api/validation-state")
+async def get_validation_state():
+    """Return the current validation gate state."""
+    if not os.path.isfile(VALIDATION_STATE_FILE):
+        return {"state": {}, "valid": False, "reason": "No validation tests have been run"}
+
+    with open(VALIDATION_STATE_FILE) as f:
+        state = json.load(f)
+
+    # Check staleness (24h)
+    now = time.time()
+    stale_threshold = 86400  # 24 hours
+    nano_ok = False
+    small_ok = False
+
+    nano = state.get("nano", {})
+    if nano.get("passed") and (now - nano.get("timestamp", 0)) < stale_threshold:
+        nano_ok = True
+
+    small = state.get("small_spikein", {})
+    if small.get("passed") and (now - small.get("timestamp", 0)) < stale_threshold:
+        small_ok = True
+
+    return {
+        "state": state,
+        "valid": nano_ok,
+        "nano_ok": nano_ok,
+        "small_ok": small_ok,
+        "reason": None if nano_ok else "Nano test stale or not passing",
+    }
+
+
+@app.get("/api/jobs/{job_id}/status")
+async def get_job_live_status(job_id: str):
+    """Live status endpoint: current stage, elapsed per stage, recent log lines."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    # Get per-stage timings from report data
+    report = (job.settings or {}).get("_report", {})
+    timings = report.get("timings", {})
+
+    # Current elapsed time
+    elapsed = 0
+    if job.started_at:
+        end = job.completed_at or time.time()
+        elapsed = end - job.started_at
+
+    # Read last 50 log lines
+    log_lines = []
+    log_path = getattr(job, 'log_path', None)
+    if not log_path:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'logs')
+        log_path = os.path.join(log_dir, f'{job_id}.log')
+    if os.path.isfile(log_path):
+        with open(log_path) as f:
+            all_lines = f.readlines()
+            log_lines = [l.rstrip() for l in all_lines[-50:]]
+
+    return {
+        "job_id": job_id,
+        "status": job.status.value,
+        "stage": job.stage.value,
+        "elapsed": round(elapsed, 1),
+        "timings": timings,
+        "reads_processed": job.reads_processed,
+        "discordant_count": job.discordant_count,
+        "split_count": job.split_count,
+        "log_lines": log_lines,
+    }
+
+
 # --- SPA serving ---
 
 @app.get("/api/health")
