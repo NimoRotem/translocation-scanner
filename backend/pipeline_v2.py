@@ -49,10 +49,10 @@ class PipelineV2:
     _STAGE_TIME_BUDGETS: dict[str, int] = {
         "extraction": 600,        # 10 min (parallel, 24 workers on 93GB BAM)
         "clustering": 120,        # 2 min
-        "clip_realignment": 120,  # 2 min
-        "annotation": 60,         # 1 min
+        "clip_realignment": 600,  # 10 min (minimap2 on 2.5M clipped reads)
+        "annotation": 300,        # 5 min
         "external_callers": 2400, # 40 min (DELLY on full WGS BAM is slow)
-        "background_model": 60,   # 1 min
+        "background_model": 300,  # 5 min
         "filtering": 30,          # 30s
         "output": 30,             # 30s
     }
